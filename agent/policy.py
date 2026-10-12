@@ -34,8 +34,31 @@ không phải xác thực người dùng production.
 """
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
 
+# ---------------------------------------------------------------------------
+# Principals store (fixture mô phỏng, load một lần khi import)
+# ---------------------------------------------------------------------------
+
+_PRINCIPALS_PATH = Path(__file__).resolve().parent.parent / "data" / "principals.json"
+
+def _load_principals() -> dict:
+    try:
+        return json.loads(_PRINCIPALS_PATH.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+
+_PRINCIPALS: dict = _load_principals()
+
+_VALID_CLASSIFICATIONS = {"public", "internal", "restricted"}
+
+
+# ---------------------------------------------------------------------------
+# PolicyContext
+# ---------------------------------------------------------------------------
 
 @dataclass(frozen=True)
 class PolicyContext:
@@ -51,5 +74,123 @@ class PolicyContext:
     expires_at: str = ""
 
 
+# ---------------------------------------------------------------------------
+# check()
+# ---------------------------------------------------------------------------
+
 def check(context: PolicyContext) -> tuple[bool, str]:
-    raise NotImplementedError("BƯỚC 3b: implement policy check")
+    """Trả (allow, reason). reason luôn là chuỗi không rỗng."""
+
+    # ------------------------------------------------------------------
+    # 1. Kiểm data_classification hợp lệ
+    # ------------------------------------------------------------------
+    if context.data_classification not in _VALID_CLASSIFICATIONS:
+        return False, (
+            f"data_classification không hợp lệ: '{context.data_classification}'. "
+            f"Chỉ chấp nhận: {sorted(_VALID_CLASSIFICATIONS)}."
+        )
+
+    # ------------------------------------------------------------------
+    # 2. Rule tối thiểu: restricted + egress → DENY (kể cả DPO)
+    # ------------------------------------------------------------------
+    if context.data_classification == "restricted" and context.egress_enabled:
+        return False, (
+            "DENY — rule tối thiểu: dữ liệu classified='restricted' không được "
+            "phép gửi ra ngoài (egress_enabled=True). Rule này không có ngoại lệ "
+            "theo principal hay purpose."
+        )
+
+    # ------------------------------------------------------------------
+    # 3. Kiểm TTL (expires_at)
+    # ------------------------------------------------------------------
+    if context.expires_at:
+        try:
+            expires = datetime.fromisoformat(context.expires_at)
+            # Đảm bảo so sánh timezone-aware
+            if expires.tzinfo is None:
+                expires = expires.replace(tzinfo=timezone.utc)
+            if datetime.now(tz=timezone.utc) > expires:
+                return False, (
+                    f"DENY — phiên làm việc đã hết hạn lúc {context.expires_at}. "
+                    "Yêu cầu token/session mới."
+                )
+        except ValueError:
+            return False, (
+                f"DENY — expires_at có định dạng không hợp lệ: '{context.expires_at}'. "
+                "Yêu cầu ISO-8601 UTC."
+            )
+
+    # ------------------------------------------------------------------
+    # 4. Kiểm principal_id (khi có requested_tool — OBO check)
+    # ------------------------------------------------------------------
+    if context.requested_tool or context.principal_id:
+        # 4a. principal phải tồn tại trong store
+        if not context.principal_id or context.principal_id not in _PRINCIPALS:
+            return False, (
+                f"DENY — principal '{context.principal_id}' không tồn tại hoặc "
+                "chưa được cấp quyền. Kiểm lại data/principals.json."
+            )
+
+        principal = _PRINCIPALS[context.principal_id]
+
+        # 4b. Kiểm purpose
+        if context.request_purpose:
+            allowed_purposes: list[str] = principal.get("purposes", [])
+            if allowed_purposes and context.request_purpose not in allowed_purposes:
+                return False, (
+                    f"DENY — principal '{context.principal_id}' không có quyền "
+                    f"thực hiện purpose '{context.request_purpose}'. "
+                    f"Các purpose được phép: {allowed_purposes}."
+                )
+
+        # 4c. Kiểm tool với scope intersection (OBO)
+        if context.requested_tool:
+            principal_tools: set[str] = set(principal.get("allowed_tools", []))
+
+            # Quyền hiệu lực = principal_tools ∩ agent_scopes
+            if context.agent_scopes:
+                effective = principal_tools & set(context.agent_scopes)
+            else:
+                effective = principal_tools
+
+            # Nếu delegation_depth > 0: còn giao với parent_scopes
+            if context.delegation_depth > 0:
+                if context.parent_scopes:
+                    effective = effective & set(context.parent_scopes)
+                else:
+                    # Không có parent_scopes nhưng là delegated call → deny
+                    # (không thể xác định quyền cha)
+                    return False, (
+                        f"DENY — delegation_depth={context.delegation_depth} "
+                        "nhưng parent_scopes rỗng; không thể tính quyền hiệu lực. "
+                        "Agent cha phải truyền explicit scopes."
+                    )
+
+            if context.requested_tool not in effective:
+                return False, (
+                    f"DENY — tool '{context.requested_tool}' nằm ngoài quyền "
+                    f"hiệu lực của principal '{context.principal_id}'. "
+                    f"Quyền hiệu lực: {sorted(effective) if effective else '∅'}. "
+                    f"(principal={sorted(principal_tools)}, "
+                    f"agent_scopes={sorted(context.agent_scopes)}"
+                    + (f", parent_scopes={sorted(context.parent_scopes)}"
+                       if context.delegation_depth > 0 else "")
+                    + ")."
+                )
+
+    # ------------------------------------------------------------------
+    # 5. Allow — tất cả điều kiện đã hợp lệ
+    # ------------------------------------------------------------------
+    parts = [
+        f"ALLOW — classification='{context.data_classification}'",
+        f"egress={context.egress_enabled}",
+        f"principal='{context.principal_id or '(none)'}'",
+    ]
+    if context.requested_tool:
+        parts.append(f"tool='{context.requested_tool}'")
+    if context.request_purpose:
+        parts.append(f"purpose='{context.request_purpose}'")
+    if context.delegation_depth > 0:
+        parts.append(f"delegation_depth={context.delegation_depth}")
+
+    return True, ", ".join(parts) + "."
